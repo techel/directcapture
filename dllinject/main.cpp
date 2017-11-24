@@ -274,6 +274,14 @@ int main2(int argc, char *argv[])
 		return 3;
 	}
 
+	BOOL isWow64;
+	IsWow64Process(hProcess, &isWow64);
+	if(isWow64)
+	{
+		std::cerr << "The process is not a 64-bit process.\n";
+		return 4;
+	}
+
 	auto *remotebuf = VirtualAllocEx(hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ);
 	auto remoteptr = (uintptr_t)remotebuf;
 
