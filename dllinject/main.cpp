@@ -213,6 +213,8 @@ int main2(int argc, char *argv[])
 	opts.add_options()("q,load-only", "Inject DLL into application and quit immediately.");
 	opts.add_options()("u,unload-only", "Unload DLL from application and quit immediately.");
 	opts.add_options()("l,lib", "Specifies path to the DLL.", cxxopts::value<std::string>()->default_value(".\\directcapture.dll"), "path");
+    opts.add_options()("m,mem", "Sets working set size of specified process in MiB", cxxopts::value<std::string>(), "min,max");
+    opts.add_options()("y,memonly", "Quit after settig working set size");
 
 	if(argc <= 1)
 	{
@@ -281,6 +283,27 @@ int main2(int argc, char *argv[])
 		std::cerr << "The process is not a 64-bit process.\n";
 		return 4;
 	}
+
+    if(opts.count("mem") > 0)
+    {
+        auto memspec = opts["mem"].as<std::string>();
+        auto split = memspec.find_first_of(",");
+        if(split == memspec.npos)
+            throw std::invalid_argument("mem option expects parameter in format \"min,max\"");
+
+        auto minstr = std::stoul(memspec.substr(0, split));
+        auto maxstr = std::stoul(memspec.substr(split + 1));
+        auto min = static_cast<SIZE_T>(minstr);
+        auto max = static_cast<SIZE_T>(maxstr);
+
+        if(SetProcessWorkingSetSize(hProcess, min * 1024 * 1024, max * 1024 * 1024) == 0)
+            std::clog << "Error changing working set size: " << GetLastError() << "\n";
+        else
+            std::clog << "Working set size changed to " << min << "MiB/" << max << "MiB\n";
+
+        if(opts.count("memonly") > 0)
+            return 0;
+    }
 
 	auto *remotebuf = VirtualAllocEx(hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ);
 	auto remoteptr = (uintptr_t)remotebuf;
