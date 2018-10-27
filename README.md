@@ -3,8 +3,8 @@
 
 This command-line tool for Windows 64-bit records another application's DirectSound output into a wave file.
 ### Binaries
-* **bin/dircapinject.exe** Sets up a recording.
-* **bin/directcapture.dll** Performs actual recoding.
+* **bin/directcapture.exe** Sets up a recording.
+* **bin/dircapdll.dll** Performs actual recoding.
 
 ### Notes
 * Note that immediately after hooking into an application the application's sound engine has to be reinitialized to ensure it will in fact record to the output file.
