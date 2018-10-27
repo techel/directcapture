@@ -1,292 +1,368 @@
-#include <cstdint>
-#include <cstdint>
-#include <cstddef>
-#include <utility>
-#include <cassert>
-#include <algorithm>
-#include <fstream>
-#include <ctime>
-#include <string>
-#include <mutex>
-#include <atomic>
-#include <memory>
-#include <map>
-#include <vector>
-#include <functional>
-
+#define NOMINMAX
 #include <Windows.h>
-#include <dsound.h>
+#include <algorithm>
+#include <iostream>
+#include <sstream>
+#include <cstddef>
+#include <cstdint>
 
-#include "wavefile.hpp"
+#include <cxxopts.hpp>
 
-class AtomicGuard
+#include <mlib/unicode/unicodecvt.hpp>
+
+namespace
 {
-public:
-	AtomicGuard(std::atomic<int> &i) : Ato(i) { ++Ato; }
-	~AtomicGuard() { --Ato; }
 
-private:
-	std::atomic<int> &Ato;
-};
-
-class Hook
+template<class T>
+std::ostream &serialize(std::ostream &o, const T &t)
 {
-public:
-	template<class Hooked, class Replacement>
-	Hook(Hooked h, Replacement r) { hook(h, r); }
-	Hook() = default;
-	~Hook() { disable(); }
-
-	template<class Hooked, class Replacement>
-	void hook(Hooked h, Replacement r)
-	{
-		HookedFunc = (void*)h;
-		ReplFunc = (void*)r;
-		ReadProcessMemory(GetCurrentProcess(), HookedFunc, &OrigInstr, sizeof(OrigInstr), nullptr);
-
-		NewInstr[0] = 0x48;
-		NewInstr[1] = 0xB8;
-		*(uintptr_t*)&NewInstr[2] = (uintptr_t)r;
-		NewInstr[10] = 0xFF;
-		NewInstr[11] = 0xE0;
-	}
-	void enable()
-	{
-		WriteProcessMemory(GetCurrentProcess(), HookedFunc, &NewInstr, sizeof(NewInstr), nullptr);
-	}
-	void disable()
-	{
-		WriteProcessMemory(GetCurrentProcess(), HookedFunc, &OrigInstr, sizeof(OrigInstr), nullptr);
-	}
-
-private:
-	void *HookedFunc, *ReplFunc;
-	uint8_t OrigInstr[12], NewInstr[12];
-};
-
-template<class Method>
-class COMHook
-{
-public:
-	COMHook() = default;
-
-	void method(Method *m)
-	{
-		NewMethod = m;
-	}
-
-	template<class COMInterface>
-	void hook(COMInterface *i, size_t funcidx)
-	{
-		assert(NewMethod);
-
-		Method **vtable = *(Method***)i;
-
-		DWORD oldprot;
-		VirtualProtect(vtable, 0x1000, PAGE_EXECUTE_READWRITE, &oldprot);
-
-		Method **entry = (Method**)&vtable[funcidx];
-		
-		if(*entry != NewMethod)
-		{
-			InstalledHooks[i] = { *entry, entry };
-			*entry = NewMethod;
-		}
-	}
-
-	void unhook()
-	{
-		for(const auto &i : InstalledHooks)
-		{
-			DWORD oldprot;
-			VirtualProtect(i.second.VTableEntry, 0x1000, PAGE_EXECUTE_READWRITE, &oldprot);
-			if(*i.second.VTableEntry == NewMethod)
-				*i.second.VTableEntry = i.second.Old;
-		}
-	}
-
-	template<class... Args>
-	auto callOld(IUnknown *obj, Args &&...args)
-	{
-		auto it = InstalledHooks.find(obj);
-		assert(it != InstalledHooks.end());
-		return it->second.Old(std::forward<Args>(args)...);
-	}
-
-	~COMHook() { unhook(); }
-
-private:
-	Method *NewMethod = nullptr;
-	struct HookInfo
-	{
-		Method *Old, **VTableEntry;
-	};
-	std::map<IUnknown*, HookInfo> InstalledHooks;
-};
-
-//
-// global information
-//
-
-struct DllData
-{
-	std::mutex Lock;
-
-	Hook DirectSoundCreateHook;
-	COMHook<HRESULT WINAPI(LPUNKNOWN, LPCDSBUFFERDESC, LPDIRECTSOUNDBUFFER*, LPUNKNOWN)> CreateSoundBufferHook;
-	COMHook<HRESULT WINAPI(LPUNKNOWN, LPWAVEFORMATEX)> SetFormatHook;
-	COMHook<HRESULT WINAPI(LPUNKNOWN, LPVOID, DWORD, LPVOID, DWORD)> UnlockHook;
-
-	std::fstream OutputFile;
-	WaveFile Output;
-	unsigned int SoundDelay = 0;
-
-	void closeOutput()
-	{
-		Output.close();
-		OutputFile.close();
-	}
-
-	void openOutput(const WAVEFORMATEX &w)
-	{
-		closeOutput();
-
-		const auto snddelay = _wgetenv(L"dircap_delay");
-		if(snddelay)
-			SoundDelay = _wtoi(snddelay);
-
-		const auto outpath = _wgetenv(L"dircap_recpath");
-		if(!outpath)
-			return;
-
-		OutputFile.open(outpath, std::ios::out | std::ios::binary);
-		if(!OutputFile)
-			return;
-
-		Output.open(OutputFile, w.nSamplesPerSec, w.wBitsPerSample, w.nChannels);
-	}
-
-	std::atomic<int> HookUsage;
-
-	~DllData()
-	{
-		{
-			std::lock_guard<std::mutex> g(Lock);
-			DirectSoundCreateHook.disable();
-			CreateSoundBufferHook.unhook();
-			SetFormatHook.unhook();
-			UnlockHook.unhook();
-		}
-
-		while(HookUsage.load() > 0)
-			Sleep(50);
-	}
-};
-
-static DllData Data;
-
-//
-// IDirectSoundBuffer hook
-//
-
-HRESULT WINAPI setFormatHook(LPUNKNOWN obj, LPWAVEFORMATEX f)
-{
-	AtomicGuard a(Data.HookUsage);
-	std::lock_guard<std::mutex> g(Data.Lock);
-
-	const HRESULT res = Data.SetFormatHook.callOld(obj, obj, f);
-	if(res == S_OK && f)
-		Data.openOutput(*f);
-	return res;
+	return o.write((const char*)&t, sizeof(t));
 }
 
-HRESULT WINAPI unlockHook(LPUNKNOWN obj, LPVOID ptr1, DWORD len1, LPVOID ptr2, DWORD len2)
+std::ostream &serialize(std::ostream &o, const std::string &s)
 {
-	AtomicGuard a(Data.HookUsage);
-	std::lock_guard<std::mutex> g(Data.Lock);
-
-	const auto res = Data.UnlockHook.callOld(obj, obj, ptr1, len1, ptr2, len2);
-	if(res == S_OK)
-	{
-		if(Data.OutputFile.is_open())
-		{
-			Data.Output.write((const char*)ptr1, static_cast<size_t>(len1));
-
-			if(ptr2)
-				Data.Output.write((const char*)ptr2, static_cast<size_t>(len2));
-
-			if(Data.SoundDelay != 0)
-				Sleep(Data.SoundDelay);
-		}
-	}
-	return res;
+	return o.write(s.c_str(), s.size() + 1);
 }
 
-//
-// IDirectSound hook
-//
-
-static HRESULT WINAPI createSoundBufferHookFunc(LPUNKNOWN obj, LPCDSBUFFERDESC pcDSBufferDesc, LPDIRECTSOUNDBUFFER *ppDSBuffer, LPUNKNOWN pUnkOuter)
+std::ostream &serialize(std::ostream &o, const std::wstring &s)
 {
-	AtomicGuard a(Data.HookUsage);
-	std::lock_guard<std::mutex> g(Data.Lock);
-
-	const auto res = Data.CreateSoundBufferHook.callOld(obj, obj, pcDSBufferDesc, ppDSBuffer, pUnkOuter);
-	if(res == S_OK)
-	{
-		Data.SetFormatHook.hook(*ppDSBuffer, 14);
-		Data.UnlockHook.hook(*ppDSBuffer, 19);
-	}
-	return res;
+	return o.write((const char*)s.c_str(), (s.size() + 1) * sizeof(wchar_t));
 }
 
-//
-// DirectSoundCreate hook
-//
-
-static HRESULT WINAPI directSoundCreateHookFunc(LPCGUID guid, LPDIRECTSOUND *ds, LPUNKNOWN o)
+enum class MoveRegister : uint8_t { rax = 0xB8, rcx = 0xB9, rdx = 0xBA };
+void emitMoveRegister(std::ostream &code, MoveRegister r, uintptr_t val) //emitted bytes: 10
 {
-	AtomicGuard a(Data.HookUsage);
-	std::lock_guard<std::mutex> g(Data.Lock);
-
-	Data.DirectSoundCreateHook.disable();
-	const auto res = DirectSoundCreate(guid, ds, o);
-	Data.DirectSoundCreateHook.enable();
-
-	if(res == S_OK)
-		Data.CreateSoundBufferHook.hook(*ds, 3);
-
-	return res;
+	serialize<uint8_t>(code, 0x48); //mov rcx, ...
+	serialize<uint8_t>(code, static_cast<uint8_t>(r));
+	serialize<uintptr_t>(code, val);
 }
 
-void setup()
+enum class MoveRegister2 : uint8_t { rcx = 0xC1, rdx = 0xC2 };
+void emitMoveEax(std::ostream &code, MoveRegister2 dst) //emitted bytes: 3
 {
-	Data.CreateSoundBufferHook.method(&createSoundBufferHookFunc);
-	Data.SetFormatHook.method(&setFormatHook);
-	Data.UnlockHook.method(&unlockHook);
+	serialize<uint8_t>(code, 0x48); //mov ..., rax
+	serialize<uint8_t>(code, 0x89);
+	serialize<uint8_t>(code, static_cast<uint8_t>(dst));
+}
 
-	HMODULE hDs = GetModuleHandleA("dsound.dll");
-	Data.DirectSoundCreateHook.hook(GetProcAddress(hDs, "DirectSoundCreate"), &directSoundCreateHookFunc);
+void emitAlignRsp(std::ostream &code)
+{
+	serialize<uint8_t>(code, 0x48); //and rsp, 0xF0 (align rsp to 16)
+	serialize<uint8_t>(code, 0x83);
+	serialize<uint8_t>(code, 0xE4);
+	serialize<uint8_t>(code, 0xF0);
+}
+
+void emitSubRsp(std::ostream &code, uint8_t val) //emitted bytes: 4
+{
+	serialize<uint8_t>(code, 0x48); //sub rsp, ...
+	serialize<uint8_t>(code, 0x83);
+	serialize<uint8_t>(code, 0xEC);
+	serialize<uint8_t>(code, val);
+}
+
+void emitAddRsp(std::ostream &code, uint8_t val)
+{
+	serialize<uint8_t>(code, 0x48); //add rsp, ...
+	serialize<uint8_t>(code, 0x83);
+	serialize<uint8_t>(code, 0xC4);
+	serialize<uint8_t>(code, val);
+}
+
+void emitCallRax(std::ostream &code) //emitted bytes: 10
+{
+	emitSubRsp(code, 32);
+	serialize<uint8_t>(code, 0xFF); //call rax
+	serialize<uint8_t>(code, 0xD0);
+	emitAddRsp(code, 32);
+}
+
+void emitSetEnvironment(std::ostream &code, uintptr_t nameptr, uintptr_t contentptr, uintptr_t funcptr)
+{
+	emitMoveRegister(code, MoveRegister::rcx, nameptr);
+	emitMoveRegister(code, MoveRegister::rdx, contentptr);
+	emitMoveRegister(code, MoveRegister::rax, funcptr);
+	emitCallRax(code);
+}
+
+void emitReturn(std::ostream &code)
+{
+	serialize(code, 0xC3); //ret
+}
+
+void emitTestRax(std::ostream &code)
+{
+	serialize<uint8_t>(code, 0x48);
+	serialize<uint8_t>(code, 0x85);
+	serialize<uint8_t>(code, 0xC0);
+}
+
+void emitJz(std::ostream &code, uint8_t off)
+{
+	serialize<uint8_t>(code, 0x74);
+	serialize<uint8_t>(code, off);
+}
+
+std::pair<std::string, uintptr_t> emitSetupCode(uintptr_t base, const std::wstring &dllpath, const std::wstring &recpath, unsigned int snddelay)
+{
+	const auto hKernel32 = GetModuleHandleA("kernel32.dll");
+	const auto setenvptr = (uintptr_t)GetProcAddress(hKernel32, "SetEnvironmentVariableW");
+	const auto loadlibptr = (uintptr_t)GetProcAddress(hKernel32, "LoadLibraryW");
+	const auto lerrorptr = (uintptr_t)GetProcAddress(hKernel32, "GetLastError");
+
+	std::stringstream code;
 	
-	std::lock_guard<std::mutex> g(Data.Lock);
-	Data.DirectSoundCreateHook.enable();
+	const auto dllpathoff = static_cast<uintptr_t>(code.tellp());
+	serialize(code, dllpath);
+
+	const auto recenvnameoff = static_cast<uintptr_t>(code.tellp());
+	serialize(code, std::wstring(L"dircap_recpath"));
+
+	const auto recenvcontoff = static_cast<uintptr_t>(code.tellp());
+	serialize(code, recpath);
+
+	const auto delayenvnameoff = static_cast<uintptr_t>(code.tellp());
+	serialize(code, std::wstring(L"dircap_delay"));
+
+	const auto delayenvcontentoff = static_cast<uintptr_t>(code.tellp());
+	serialize(code, std::to_wstring(snddelay));
+
+	const auto codeoff = static_cast<uintptr_t>(code.tellp());
+	emitAlignRsp(code);
+
+	emitSetEnvironment(code, base + recenvnameoff, base + recenvcontoff, setenvptr);
+	emitSetEnvironment(code, base + delayenvnameoff, base + delayenvcontentoff, setenvptr);
+
+	emitMoveRegister(code, MoveRegister::rcx, base + dllpathoff);
+	emitMoveRegister(code, MoveRegister::rax, loadlibptr); //LoadLibraryW
+	emitCallRax(code);
+
+	emitMoveRegister(code, MoveRegister::rax, lerrorptr); //GetLastError
+	emitCallRax(code);
+
+	emitAddRsp(code, 8);
+	emitReturn(code);
+
+	return { code.str(), codeoff };
 }
 
-static std::atomic<HMODULE> hDllModule;
-
-__declspec(dllexport) void unloadDircap()
+std::pair<std::string, uintptr_t> emitUnloadCode(uintptr_t base, const std::wstring &dllpath)
 {
-#pragma comment(linker, "/EXPORT:" __FUNCTION__ "=" __FUNCDNAME__ )
+	const auto hKernel32 = GetModuleHandleA("kernel32.dll");
+	const auto gethmod = (uintptr_t)GetProcAddress(hKernel32, "GetModuleHandleW");
+	const auto getproc = (uintptr_t)GetProcAddress(hKernel32, "GetProcAddress");
+	const auto lerrorptr = (uintptr_t)GetProcAddress(hKernel32, "GetLastError");
 
-	FreeLibraryAndExitThread(hDllModule, 0);
+	std::stringstream code;
+
+	const auto dllpathoff = static_cast<uintptr_t>(code.tellp());
+	serialize(code, dllpath);
+
+	const auto unloadnameoff = static_cast<uintptr_t>(code.tellp());
+	serialize(code, std::string("unloadDircap"));
+
+	const auto codeoff = static_cast<uintptr_t>(code.tellp());
+	emitAlignRsp(code);
+
+	emitMoveRegister(code, MoveRegister::rcx, base + dllpathoff);
+	emitMoveRegister(code, MoveRegister::rax, gethmod); //GetModuleHandleW
+	emitCallRax(code);
+
+	emitTestRax(code);
+	emitJz(code, 33);
+
+	emitMoveEax(code, MoveRegister2::rcx); //return value -> rcx
+	emitMoveRegister(code, MoveRegister::rdx, base + unloadnameoff);
+	emitMoveRegister(code, MoveRegister::rax, getproc); //GetProcAddress
+	emitCallRax(code);
+
+	emitTestRax(code);
+	emitJz(code, 10);
+
+	emitCallRax(code); //call unload function
+
+	emitMoveRegister(code, MoveRegister::rax, lerrorptr); //GetLastError
+	emitCallRax(code);
+
+	emitAddRsp(code, 8);
+	emitReturn(code);
+
+	return { code.str(), codeoff };
 }
 
-BOOL WINAPI DllMain(HMODULE hMod, DWORD r, LPVOID)
+void inject(HANDLE hProcess, uintptr_t base, const std::pair<std::string, uintptr_t> &exec)
 {
-	if(r == DLL_PROCESS_ATTACH)
+	WriteProcessMemory(hProcess, (void*)base, exec.first.data(), exec.first.size(), nullptr);
+	std::clog << "Code placed at 0x" << (void*)base << ".\n";
+
+	DWORD threadid;
+	auto hThread = CreateRemoteThread(hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)(base + exec.second), nullptr, 0, &threadid);
+	std::clog << "Thread with ID " << threadid << " created.\n";
+	WaitForSingleObject(hThread, INFINITE);
+
+	DWORD c;
+	GetExitCodeThread(hThread, &c);
+	std::clog << "Thread finished with code " << c << (c != 0 ? " [ERROR].\n" : ".\n");
+	CloseHandle(hThread);
+
+    if(c == 126)
+        std::cout << "The DLL was not found.\n";
+}
+
+std::wstring replaceExepath(const std::string &path)
+{
+    wchar_t buf[MAX_PATH];
+    buf[GetModuleFileNameW(GetModuleHandle(0), buf, MAX_PATH)] = L'\0';
+
+    auto rend = std::make_reverse_iterator(buf);
+    if(auto ptr = std::find(std::make_reverse_iterator(buf + MAX_PATH), rend, L'\\'); ptr != rend) //strip exe file name
+        *ptr = L'\0';
+
+    auto wpath = mlib::unicode::toNative(path);
+
+    static const std::wstring search = L"<exepath>";
+    if(auto pos = wpath.find(search); pos != wpath.npos)
+        wpath = wpath.substr(0, pos) + buf + wpath.substr(pos + search.size());
+
+    return wpath;
+}
+
+int main2(int argc, char *argv[])
+{
+	cxxopts::Options opts("dircapinject", "Records DirectSound output from another application (x64).");
+
+	opts.add_options()("p,pid", "Process ID of target application.", cxxopts::value<DWORD>(), "number");
+	opts.add_options()("w,window", "Window title of target application. Overwrites -pid.", cxxopts::value<std::string>(), "text");
+	opts.add_options()("o,output", "Output wave file.", cxxopts::value<std::string>()->default_value(".\\rec.wav"), "path");
+	opts.add_options()("d,delay", "Optional time in milliseconds to wait after each write to sound buffer.",
+				        cxxopts::value<unsigned int>()->default_value("0"), "number");
+	opts.add_options()("q,load-only", "Inject DLL into application and quit immediately.");
+	opts.add_options()("u,unload-only", "Unload DLL from application and quit immediately.");
+	opts.add_options()("l,lib", "Specifies path to the DLL.", cxxopts::value<std::string>()->default_value("<exepath>\\dircapdll.dll"), "path");
+    opts.add_options()("m,mem", "Sets working set size of specified process in MiB", cxxopts::value<std::string>(), "min,max");
+    opts.add_options()("y,memonly", "Quit after settig working set size");
+
+	if(argc <= 1)
 	{
-		hDllModule = hMod;
-		setup();
+		std::cout << opts.help();
+		return 0;
 	}
-	return TRUE;
+
+	auto optres = opts.parse(argc, argv);
+
+	DWORD pid;
+	unsigned int soundDelay = 0;
+	std::wstring outpath;
+	bool InjectOnly = optres.count("load-only") > 0;
+	bool UnloadOnly = optres.count("unload-only") > 0;
+
+	if(optres.count("window") > 0)
+	{
+		const auto hWnd = FindWindowA(nullptr, optres["window"].as<std::string>().c_str());
+		if(!hWnd)
+		{
+			std::cerr << "Window not found\n";
+			return 42;
+		}
+		GetWindowThreadProcessId(hWnd, &pid);
+	}
+	else
+	{
+		if(optres.count("pid") <= 0)
+			throw std::invalid_argument("Process ID required.");
+
+		pid = optres["pid"].as<DWORD>();
+	}
+
+	if(!UnloadOnly)
+	{
+		outpath = mlib::unicode::toNative(optres["output"].as<std::string>());
+		soundDelay = optres["delay"].as<unsigned int>();
+	}
+
+	wchar_t fulloutpath[MAX_PATH];
+	if(!_wfullpath(fulloutpath, outpath.c_str(), MAX_PATH))
+	{
+		std::cerr << "Path to output file is malformed.\n";
+		return 2;
+	}
+
+	const auto fulldllpath = replaceExepath(optres["lib"].as<std::string>());
+
+	auto hProcess = OpenProcess(PROCESS_ALL_ACCESS | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, pid);
+	if(!hProcess)
+	{
+		std::cerr << "Opening process failed with error " << GetLastError() << '\n';
+		return 3;
+	}
+
+	BOOL isWow64;
+	IsWow64Process(hProcess, &isWow64);
+	if(isWow64)
+	{
+		std::cerr << "The process is not a 64-bit process.\n";
+		return 4;
+	}
+
+    if(optres.count("mem") > 0)
+    {
+        auto memspec = optres["mem"].as<std::string>();
+        auto split = memspec.find_first_of(",");
+        if(split == memspec.npos)
+            throw std::invalid_argument("mem option expects parameter in format \"min,max\"");
+
+        auto minstr = std::stoul(memspec.substr(0, split));
+        auto maxstr = std::stoul(memspec.substr(split + 1));
+        auto min = static_cast<SIZE_T>(minstr);
+        auto max = static_cast<SIZE_T>(maxstr);
+
+        if(SetProcessWorkingSetSize(hProcess, min * 1024 * 1024, max * 1024 * 1024) == 0)
+            std::clog << "Error changing working set size: " << GetLastError() << "\n";
+        else
+            std::clog << "Working set size changed to " << min << "MiB/" << max << "MiB\n";
+
+        if(optres.count("memonly") > 0)
+            return 0;
+    }
+
+	auto *remotebuf = VirtualAllocEx(hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ);
+	auto remoteptr = (uintptr_t)remotebuf;
+
+	if(!UnloadOnly)
+	{
+		const auto execdata = emitSetupCode(remoteptr, fulldllpath, fulloutpath, soundDelay);
+		inject(hProcess, remoteptr, execdata);
+	}
+
+	if(!InjectOnly && !UnloadOnly)
+	{
+		std::clog << "Waiting for keypress to release capture...\n";
+		std::cin.get();
+	}
+
+	if(!InjectOnly)
+	{
+		const auto execdata = emitUnloadCode(remoteptr, fulldllpath);
+		inject(hProcess, remoteptr, execdata);
+	}
+
+	VirtualFreeEx(hProcess, remotebuf, 0x1000, MEM_RELEASE);
+	CloseHandle(hProcess);
+
+	return 0;
+}
+
+}
+
+int main(int argc, char *argv[])
+{
+	try
+	{
+		return main2(argc, argv);
+	}
+	catch(const std::exception &e)
+	{
+		std::cerr << e.what();
+		return 1;
+	}
 }
